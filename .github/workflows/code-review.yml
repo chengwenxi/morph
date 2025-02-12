@@ -30,7 +30,6 @@ jobs:
           pip3 install openai
           pip3 install PyGithub
           export PR_NUMBER=${{ github.event.pull_request.number }}
-          export REPOSITORY=${{ github.repository }}
           export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
           export OPENAI_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
           python3 check.py
