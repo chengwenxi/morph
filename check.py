@@ -8,7 +8,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PR_NUMBER = os.environ.get('PR_NUMBER')
 g = Github(GITHUB_TOKEN)
 print(GITHUB_TOKEN)
-repo = g.get_repo("morph-l2/morph-backend")
+repo = g.get_repo("chengwenxi/morph-backend")
 pr = repo.get_pull(PR_NUMBER)  # 获取 PR（你可以根据实际需求获取 PR ID）
 # 获取 PR 代码变更
 diff = "\n".join([file.patch for file in pr.get_files()])
