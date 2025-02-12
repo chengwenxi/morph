@@ -1,0 +1,35 @@
+name: Ai Code Review
+
+on:
+  pull_request:
+    branches:
+      - main
+      - release/*
+
+jobs:
+  code-review:
+    runs-on: ubuntu-latest
+    # strategy:
+    #   matrix:
+    #     go-version: [ '1.19', '1.20', '1.21.x' ]
+    steps:
+      - name: Checkout App Code
+        uses: actions/checkout@main
+      # - name: Setup Go ${{ matrix.go-version }}
+      #   uses: actions/setup-go@v5
+      #   with:
+      #     go-version: 1.22
+      # You can test your matrix by printing the current Go version
+      - name: Setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9' 
+      - name: python
+        run: | 
+          # pip3 install aiohttp
+          pip3 install PyGithub
+          pip3 install anthropic
+          export PR_NUMBER=${{ github.event.pull_request.number }}
+          export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          export ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+          python3 check.py
