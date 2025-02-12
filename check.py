@@ -24,5 +24,5 @@ response = client.messages.create(
 )
 # print(response.content)
 # 生成评论并提交到 PR
-# comment = response["choices"][0]["message"]["content"]
-pr.create_issue_comment(response)
+comment = response.content[0].text
+pr.create_issue_comment(comment)
