@@ -26,10 +26,10 @@ jobs:
           python-version: '3.9' 
       - name: python
         run: | 
-          pip3 install aiohttp
-          pip3 install openai
+          # pip3 install aiohttp
           pip3 install PyGithub
+          pip3 install anthropic
           export PR_NUMBER=${{ github.event.pull_request.number }}
           export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
-          export OPENAI_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+          export ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
           python3 check.py
