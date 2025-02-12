@@ -21,6 +21,6 @@ response = openai.ChatCompletion.create(
         {"role": "user", "content": f"请审查以下代码变更并提供反馈：\n{diff}"}
     ]
 )
-# 生成评论并提交到 PR
+生成评论并提交到 PR
 comment = response["choices"][0]["message"]["content"]
 pr.create_issue_comment(comment)
