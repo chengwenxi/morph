@@ -16,13 +16,14 @@ diff = "\n".join([file.patch for file in pr.get_files()])
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # 发送请求
 response = client.messages.create(
-    model="anthropic/claude-3-5-sonnet-20240620",
-    max_tokens=256,
+    model="claude-3-5-sonnet-20240620",
+    max_tokens=1024,
     messages=[
-        {"role": "user", "content": f"你是一个经验丰富的代码审查助手，负责审查 PR 代码的质量。请审查以下代码变更并提供反馈：\n{diff}"}
+        {"role": "system", "content": "你是一个经验丰富的代码审查助手，负责审查 PR 代码的质量。"},
+        {"role": "user", "content": f"请审查以下代码变更并提供反馈：\n{diff}"}
     ]
 )
-print(response.content)
+# print(response.content)
 # 生成评论并提交到 PR
 # comment = response["choices"][0]["message"]["content"]
 pr.create_issue_comment(response)
