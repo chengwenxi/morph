@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 import os
-import openai
 from github import Github
-
 import anthropic
 
 # 读取 GitHub Token 和 PR 信息
