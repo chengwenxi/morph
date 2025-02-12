@@ -19,8 +19,7 @@ response = client.messages.create(
     model="claude-3-5-sonnet-20240620",
     max_tokens=1024,
     messages=[
-        {"role": "system", "content": "你是一个经验丰富的代码审查助手，负责审查 PR 代码的质量。"},
-        {"role": "user", "content": f"请审查以下代码变更并提供反馈：\n{diff}"}
+        {"role": "user", "content": f"你是一个经验丰富的代码审查助手，负责审查 PR 代码的质量。请审查以下代码变更并提供反馈：\n{diff}"}
     ]
 )
 # print(response.content)
