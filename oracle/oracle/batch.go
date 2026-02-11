@@ -10,6 +10,7 @@ import (
 
 	"morph-l2/bindings/bindings"
 	"morph-l2/node/derivation"
+	nodetypes "morph-l2/node/types"
 	"morph-l2/oracle/backoff"
 
 	"github.com/morph-l2/go-ethereum/accounts/abi/bind"
@@ -94,7 +95,7 @@ func (o *Oracle) getBatchSubmissionByLogs(rLogs []types.Log, recordBatchSubmissi
 		if err != nil {
 			return fmt.Errorf("get transaction by hash error:%v", err)
 		}
-		signer := types.NewLondonSignerWithEIP4844(tx.ChainId())
+		signer := types.NewViridianSigner(tx.ChainId())
 		msg, err := tx.AsMessage(signer, tx.GasFeeCap())
 		if err != nil {
 			return err
@@ -154,13 +155,29 @@ func (o *Oracle) getBatchSubmissionByLogs(rLogs []types.Log, recordBatchSubmissi
 				WithdrawalRoot         [32]uint8 "json:\"withdrawalRoot\""
 			})
 			batch = eth.RPCRollupBatch{
-				Version:                uint(rollupBatchData.Version),
-				ParentBatchHeader:      rollupBatchData.ParentBatchHeader,
-				BlockContexts:          rollupBatchData.BlockContexts,
-				SkippedL1MessageBitmap: rollupBatchData.SkippedL1MessageBitmap,
-				PrevStateRoot:          common.BytesToHash(rollupBatchData.PrevStateRoot[:]),
-				PostStateRoot:          common.BytesToHash(rollupBatchData.PostStateRoot[:]),
-				WithdrawRoot:           common.BytesToHash(rollupBatchData.WithdrawalRoot[:]),
+				Version:           uint(rollupBatchData.Version),
+				ParentBatchHeader: rollupBatchData.ParentBatchHeader,
+				BlockContexts:     rollupBatchData.BlockContexts,
+				//SkippedL1MessageBitmap: rollupBatchData.SkippedL1MessageBitmap,
+				PrevStateRoot: common.BytesToHash(rollupBatchData.PrevStateRoot[:]),
+				PostStateRoot: common.BytesToHash(rollupBatchData.PostStateRoot[:]),
+				WithdrawRoot:  common.BytesToHash(rollupBatchData.WithdrawalRoot[:]),
+			}
+			parentBatchHeader := nodetypes.BatchHeaderBytes(batch.ParentBatchHeader)
+			parentVersion, err := parentBatchHeader.Version()
+			if err != nil {
+				return fmt.Errorf("decode parent batch version error:%v", err)
+			}
+			if batch.Version == 1 && parentVersion == 0 {
+				parentBatchIndex, err := parentBatchHeader.BatchIndex()
+				if err != nil {
+					return fmt.Errorf("decode parent batch index error:%v", err)
+				}
+				parentBatch, err := o.l2Client.GetRollupBatchByIndex(o.ctx, parentBatchIndex)
+				if err != nil {
+					return fmt.Errorf("get parent batch error:%v", err)
+				}
+				batch.Sidecar = parentBatch.Sidecar
 			}
 		} else {
 			continue
@@ -175,7 +192,7 @@ func (o *Oracle) getBatchSubmissionByLogs(rLogs []types.Log, recordBatchSubmissi
 			continue
 		}
 		if rollupCommitBatch.BatchIndex.Uint64() > batchIndex {
-			return fmt.Errorf(fmt.Sprintf("batch is incontinuity,expect %v,have %v", batchIndex, rollupCommitBatch.BatchIndex.Uint64()))
+			return fmt.Errorf("batch is incontinuity, expect %v, have %v", batchIndex, rollupCommitBatch.BatchIndex.Uint64())
 		}
 		// set batchIndex to new batch index + 1
 		batchIndex = rollupCommitBatch.BatchIndex.Uint64() + 1

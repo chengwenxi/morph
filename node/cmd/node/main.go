@@ -14,6 +14,7 @@ import (
 	"github.com/urfave/cli"
 
 	"morph-l2/bindings/bindings"
+	"morph-l2/node/blocktag"
 	"morph-l2/node/cmd/keyconverter"
 	node "morph-l2/node/core"
 	"morph-l2/node/db"
@@ -41,6 +42,7 @@ func main() {
 	app.Action = L2NodeMain
 	app.Commands = []cli.Command{
 		keyConverterCmd,
+		versionCmd,
 	}
 	err := app.Run(os.Args)
 	if err != nil {
@@ -51,12 +53,13 @@ func main() {
 
 func L2NodeMain(ctx *cli.Context) error {
 	var (
-		err      error
-		executor *node.Executor
-		syncer   *sync.Syncer
-		ms       *mock.Sequencer
-		tmNode   *tmnode.Node
-		dvNode   *derivation.Derivation
+		err         error
+		executor    *node.Executor
+		syncer      *sync.Syncer
+		ms          *mock.Sequencer
+		tmNode      *tmnode.Node
+		dvNode      *derivation.Derivation
+		blockTagSvc *blocktag.BlockTagService
 
 		nodeConfig = node.DefaultConfig()
 	)
@@ -141,6 +144,19 @@ func L2NodeMain(ctx *cli.Context) error {
 				return fmt.Errorf("failed to start consensus node, error: %v", err)
 			}
 		}
+
+		// Start BlockTagService for sequencer mode
+		blockTagConfig := blocktag.DefaultConfig()
+		if err := blockTagConfig.SetCliContext(ctx); err != nil {
+			return fmt.Errorf("blocktag config set cli context error: %w", err)
+		}
+		blockTagSvc, err = blocktag.NewBlockTagService(context.Background(), executor.L2Client(), blockTagConfig, nodeConfig.Logger)
+		if err != nil {
+			return fmt.Errorf("failed to create BlockTagService: %w", err)
+		}
+		if err := blockTagSvc.Start(); err != nil {
+			return fmt.Errorf("failed to start BlockTagService: %w", err)
+		}
 	}
 
 	interruptChannel := make(chan os.Signal, 1)
@@ -166,6 +182,9 @@ func L2NodeMain(ctx *cli.Context) error {
 	}
 	if dvNode != nil {
 		dvNode.Stop()
+	}
+	if blockTagSvc != nil {
+		blockTagSvc.Stop()
 	}
 
 	return nil

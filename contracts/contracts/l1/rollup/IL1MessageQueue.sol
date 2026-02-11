@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.16;
+pragma solidity =0.8.24;
 
 interface IL1MessageQueue {
     /**********
@@ -56,6 +56,11 @@ interface IL1MessageQueue {
 
     /// @notice The start index of all pending inclusion messages.
     function pendingQueueIndex() external view returns (uint256);
+
+    /// @notice Return the enqueue timestamp of the first unfinalized message.
+    /// @dev Used for checking if L1 messages are being processed within acceptable time.
+    /// @return timestamp The block.timestamp when the first unfinalized message was enqueued.
+    function getFirstUnfinalizedMessageEnqueueTime() external view returns (uint256 timestamp);
 
     /// @notice Return the index of next appended message.
     /// @dev Also the total number of appended messages.

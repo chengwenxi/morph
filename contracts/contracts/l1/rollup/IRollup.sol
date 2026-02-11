@@ -8,14 +8,16 @@ interface IRollup {
 
     /// @param version                  The version of current batch.
     /// @param parentBatchHeader        The header of parent batch, see the comments of `BatchHeaderV0Codec`.
-    /// @param blockContexts            The block contexts of current batch.
+    /// @param lastBlockNumber          The last block number in this batch
+    /// @param numL1Messages            The number of L1 messages in this batch
     /// @param prevStateRoot            The state root of parent batch.
     /// @param postStateRoot            The state root of current batch.
     /// @param withdrawalRoot           The withdraw trie root of current batch.
     struct BatchDataInput {
         uint8 version;
         bytes parentBatchHeader;
-        bytes blockContexts;
+        uint64 lastBlockNumber;
+        uint16 numL1Messages;
         bytes32 prevStateRoot;
         bytes32 postStateRoot;
         bytes32 withdrawalRoot;
@@ -116,6 +118,11 @@ interface IRollup {
     /// @param newPercent  The new proofRewardPercent.
     event UpdateProofRewardPercent(uint256 oldPercent, uint256 newPercent);
 
+    /// @notice Emitted when the rollup delay period is updated.
+    /// @param oldPeriod  The old rollupDelayPeriod.
+    /// @param newPeriod  The new rollupDelayPeriod.
+    event UpdateRollupDelayPeriod(uint256 oldPeriod, uint256 newPeriod);
+
     /// @notice Emit when prove remaining claimed.
     /// @param receiver  receiver address.
     /// @param amount    claimed amount.
@@ -179,6 +186,20 @@ interface IRollup {
         BatchDataInput calldata batchDataInput,
         BatchSignatureInput calldata batchSignatureInput
     ) external payable;
+
+    /// @notice Commit a batch with ZKP proof for permissionless submission.
+    /// @dev This function allows anyone to submit batches when the sequencer is offline or censoring.
+    ///
+    /// @param batchDataInput       The BatchDataInput struct
+    /// @param batchSignatureInput  The BatchSignatureInput struct
+    /// @param batchHeader          The batch header for ZKP verification
+    /// @param batchProof           The ZKP proof data
+    function commitBatchWithProof(
+        BatchDataInput calldata batchDataInput,
+        BatchSignatureInput calldata batchSignatureInput,
+        bytes calldata batchHeader,
+        bytes calldata batchProof
+    ) external;
 
     /// @notice Revert a pending batch.
     /// @dev one can only revert unfinalized batches.

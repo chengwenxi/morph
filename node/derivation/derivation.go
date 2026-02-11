@@ -6,15 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"os"
 	"time"
 
 	"github.com/morph-l2/go-ethereum"
 	"github.com/morph-l2/go-ethereum/accounts/abi"
 	"github.com/morph-l2/go-ethereum/accounts/abi/bind"
 	"github.com/morph-l2/go-ethereum/common"
+	"github.com/morph-l2/go-ethereum/common/hexutil"
 	eth "github.com/morph-l2/go-ethereum/core/types"
 	"github.com/morph-l2/go-ethereum/crypto"
+	"github.com/morph-l2/go-ethereum/crypto/kzg4844"
 	geth "github.com/morph-l2/go-ethereum/eth"
 	"github.com/morph-l2/go-ethereum/ethclient"
 	"github.com/morph-l2/go-ethereum/ethclient/authclient"
@@ -48,8 +49,9 @@ type Derivation struct {
 	l1BeaconClient        *L1BeaconClient
 	L2ToL1MessagePasser   *bindings.L2ToL1MessagePasser
 
-	rollupABI       *abi.ABI
-	legacyRollupABI *abi.ABI // before remove skipMap
+	rollupABI             *abi.ABI
+	legacyRollupABI       *abi.ABI // before remove skipMap
+	beforeMoveBlockCtxABI *abi.ABI
 
 	db Database
 
@@ -61,6 +63,10 @@ type Derivation struct {
 	pollInterval        time.Duration
 	logProgressInterval time.Duration
 	stop                chan struct{}
+
+	// geth upgrade config (fetched once at startup)
+	switchTime uint64
+	useZktrie  bool
 }
 
 type DeployContractBackend interface {
@@ -75,6 +81,7 @@ func NewDerivationClient(ctx context.Context, cfg *Config, syncer *sync.Syncer, 
 	if err != nil {
 		return nil, err
 	}
+	// L2 geth endpoint (required - current geth)
 	aClient, err := authclient.DialContext(context.Background(), cfg.L2.EngineAddr, cfg.L2.JwtSecret)
 	if err != nil {
 		return nil, err
@@ -83,6 +90,24 @@ func NewDerivationClient(ctx context.Context, cfg *Config, syncer *sync.Syncer, 
 	if err != nil {
 		return nil, err
 	}
+
+	// L2Next endpoint (optional - for upgrade switch)
+	var aNextClient *authclient.Client
+	var eNextClient *ethclient.Client
+	if cfg.L2Next != nil && cfg.L2Next.EngineAddr != "" && cfg.L2Next.EthAddr != "" {
+		aNextClient, err = authclient.DialContext(context.Background(), cfg.L2Next.EngineAddr, cfg.L2Next.JwtSecret)
+		if err != nil {
+			return nil, err
+		}
+		eNextClient, err = ethclient.Dial(cfg.L2Next.EthAddr)
+		if err != nil {
+			return nil, err
+		}
+		logger.Info("L2Next geth configured (upgrade switch enabled)", "engineAddr", cfg.L2Next.EngineAddr, "ethAddr", cfg.L2Next.EthAddr)
+	} else {
+		logger.Info("L2Next geth not configured (no upgrade switch)")
+	}
+
 	msgPasser, err := bindings.NewL2ToL1MessagePasser(predeploys.L2ToL1MessagePasserAddr, eClient)
 	if err != nil {
 		return nil, err
@@ -92,6 +117,10 @@ func NewDerivationClient(ctx context.Context, cfg *Config, syncer *sync.Syncer, 
 		return nil, err
 	}
 	legacyRollupAbi, err := types.LegacyRollupMetaData.GetAbi()
+	if err != nil {
+		return nil, err
+	}
+	beforeMoveBlockCtxAbi, err := types.BeforeMoveBlockCtxABI.GetAbi()
 	if err != nil {
 		return nil, err
 	}
@@ -109,6 +138,15 @@ func NewDerivationClient(ctx context.Context, cfg *Config, syncer *sync.Syncer, 
 	}
 	baseHttp := NewBasicHTTPClient(cfg.BeaconRpc, logger)
 	l1BeaconClient := NewL1BeaconClient(baseHttp)
+
+	// Fetch geth config once at startup for root validation skip logic (with retry)
+	gethCfg, err := types.FetchGethConfigWithRetry(cfg.L2.EthAddr, logger)
+	if err != nil {
+		cancel() // cancel context to avoid leak
+		return nil, fmt.Errorf("failed to fetch geth config: %w", err)
+	}
+	logger.Info("Geth config fetched", "switchTime", gethCfg.SwitchTime, "useZktrie", gethCfg.UseZktrie)
+
 	return &Derivation{
 		ctx:                   ctx,
 		db:                    db,
@@ -118,10 +156,11 @@ func NewDerivationClient(ctx context.Context, cfg *Config, syncer *sync.Syncer, 
 		rollup:                rollup,
 		rollupABI:             rollupAbi,
 		legacyRollupABI:       legacyRollupAbi,
+		beforeMoveBlockCtxABI: beforeMoveBlockCtxAbi,
 		logger:                logger,
 		RollupContractAddress: cfg.RollupContractAddress,
 		confirmations:         cfg.L1.Confirmations,
-		l2Client:              types.NewRetryableClient(aClient, eClient, tmlog.NewTMLogger(tmlog.NewSyncWriter(os.Stdout))),
+		l2Client:              types.NewRetryableClient(aClient, eClient, aNextClient, eNextClient, gethCfg.SwitchTime, logger),
 		cancel:                cancel,
 		stop:                  make(chan struct{}),
 		startHeight:           cfg.StartHeight,
@@ -132,6 +171,8 @@ func NewDerivationClient(ctx context.Context, cfg *Config, syncer *sync.Syncer, 
 		metrics:               metrics,
 		l1BeaconClient:        l1BeaconClient,
 		L2ToL1MessagePasser:   msgPasser,
+		switchTime:            gethCfg.SwitchTime,
+		useZktrie:             gethCfg.UseZktrie,
 	}, nil
 }
 
@@ -238,25 +279,47 @@ func (d *Derivation) derivationBlock(ctx context.Context) {
 			d.logger.Error("get withdrawal root failed", "error", err)
 			return
 		}
-		if !bytes.Equal(lastHeader.Root.Bytes(), batchInfo.root.Bytes()) || !bytes.Equal(withdrawalRoot[:], batchInfo.withdrawalRoot.Bytes()) {
-			d.metrics.SetBatchStatus(stateException)
-			// TODO The challenge switch is currently on and will be turned on in the future
-			if d.validator != nil && d.validator.ChallengeEnable() {
-				if err := d.validator.ChallengeState(batchInfo.batchIndex); err != nil {
-					d.logger.Error("challenge state failed")
-					return
+
+		rootMismatch := !bytes.Equal(lastHeader.Root.Bytes(), batchInfo.root.Bytes())
+		withdrawalMismatch := !bytes.Equal(withdrawalRoot[:], batchInfo.withdrawalRoot.Bytes())
+
+		if rootMismatch || withdrawalMismatch {
+			// Check if should skip validation during upgrade transition
+			// Skip if: (before switch && MPT geth) or (after switch && ZK geth)
+			skipValidation := false
+			if d.switchTime > 0 {
+				beforeSwitch := lastHeader.Time < d.switchTime
+				if (beforeSwitch && !d.useZktrie) || (!beforeSwitch && d.useZktrie) {
+					skipValidation = true
+					d.logger.Info("Root validation skipped during upgrade transition",
+						"originStateRootHash", batchInfo.root,
+						"deriveStateRootHash", lastHeader.Root.Hex(),
+						"blockTimestamp", lastHeader.Time,
+						"switchTime", d.switchTime,
+						"useZktrie", d.useZktrie,
+					)
 				}
 			}
-			d.logger.Info("root hash or withdrawal hash is not equal",
-				"originStateRootHash", batchInfo.root,
-				"deriveStateRootHash", lastHeader.Root.Hex(),
-				"batchWithdrawalRoot", batchInfo.withdrawalRoot.Hex(),
-				"deriveWithdrawalRoot", common.BytesToHash(withdrawalRoot[:]).Hex(),
-			)
-			return
-		} else {
-			d.metrics.SetBatchStatus(stateNormal)
+
+			if !skipValidation {
+				d.metrics.SetBatchStatus(stateException)
+				// TODO The challenge switch is currently on and will be turned on in the future
+				if d.validator != nil && d.validator.ChallengeEnable() {
+					if err := d.validator.ChallengeState(batchInfo.batchIndex); err != nil {
+						d.logger.Error("challenge state failed")
+						return
+					}
+				}
+				d.logger.Error("root hash or withdrawal hash is not equal",
+					"originStateRootHash", batchInfo.root,
+					"deriveStateRootHash", lastHeader.Root.Hex(),
+					"batchWithdrawalRoot", batchInfo.withdrawalRoot.Hex(),
+					"deriveWithdrawalRoot", common.BytesToHash(withdrawalRoot[:]).Hex(),
+				)
+				return
+			}
 		}
+		d.metrics.SetBatchStatus(stateNormal)
 		d.metrics.SetL1SyncHeight(lg.BlockNumber)
 	}
 
@@ -291,26 +354,91 @@ func (d *Derivation) fetchRollupDataByTxHash(txHash common.Hash, blockNumber uin
 	if err != nil {
 		return nil, err
 	}
-	// query blob
-	block, err := d.l1Client.BlockByNumber(d.ctx, big.NewInt(int64(blockNumber)))
-	if err != nil {
-		return nil, err
-	}
-	indexedBlobHashes := dataAndHashesFromTxs(block.Transactions(), tx)
+
+	// Get block header to retrieve timestamp
 	header, err := d.l1Client.HeaderByNumber(d.ctx, big.NewInt(int64(blockNumber)))
 	if err != nil {
 		return nil, err
 	}
-	var bts eth.BlobTxSidecar
-	if len(indexedBlobHashes) != 0 {
-		bts, err = d.l1BeaconClient.GetBlobSidecar(context.Background(), L1BlockRef{
+
+	// Get transaction blob hashes
+	blobHashes := tx.BlobHashes()
+	if len(blobHashes) > 0 {
+		d.logger.Info("Transaction contains blobs", "txHash", txHash, "blobCount", len(blobHashes))
+
+		// Initialize indexedBlobHashes as nil
+		var indexedBlobHashes []IndexedBlobHash
+
+		// Only try to build IndexedBlobHash array if not forcing get all blobs
+		// Try to get the block to build IndexedBlobHash array
+		block, err := d.l1Client.BlockByNumber(d.ctx, big.NewInt(int64(blockNumber)))
+		if err == nil {
+			// Successfully got the block, now build IndexedBlobHash array
+			d.logger.Info("Building IndexedBlobHash array from block", "blockNumber", blockNumber)
+			indexedBlobHashes = dataAndHashesFromTxs(block.Transactions(), tx)
+			d.logger.Info("Built IndexedBlobHash array", "count", len(indexedBlobHashes))
+		} else {
+			d.logger.Info("Failed to get block, will try fetching all blobs", "blockNumber", blockNumber, "error", err)
+		}
+
+		// Get all blobs corresponding to this timestamp
+		blobSidecars, err := d.l1BeaconClient.GetBlobSidecarsEnhanced(d.ctx, L1BlockRef{
 			Time: header.Time,
 		}, indexedBlobHashes)
 		if err != nil {
-			return nil, fmt.Errorf("getBlockSidecar error:%v", err)
+			return nil, fmt.Errorf("failed to get blobs, continuing processing:%v", err)
+		}
+		if len(blobSidecars) > 0 {
+			// Create blob sidecar
+			var blobTxSidecar eth.BlobTxSidecar
+			matchedCount := 0
+
+			// Match blobs
+			for _, sidecar := range blobSidecars {
+				var commitment kzg4844.Commitment
+				copy(commitment[:], sidecar.KZGCommitment[:])
+				versionedHash := KZGToVersionedHash(commitment)
+
+				for _, expectedHash := range blobHashes {
+					if bytes.Equal(versionedHash[:], expectedHash[:]) {
+						matchedCount++
+						d.logger.Info("Found matching blob", "index", sidecar.Index, "hash", versionedHash.Hex())
+
+						// Decode and process blob data
+						var blob Blob
+						b, err := hexutil.Decode(sidecar.Blob)
+						if err != nil {
+							d.logger.Error("Failed to decode blob data", "error", err)
+							continue
+						}
+						copy(blob[:], b)
+
+						// Verify blob
+						//if err := VerifyBlobProof(&blob, commitment, kzg4844.Proof(sidecar.KZGProof)); err != nil {
+						//	d.logger.Error("Blob verification failed", "error", err)
+						//	continue
+						//}
+
+						// Add to sidecar
+						blobTxSidecar.Blobs = append(blobTxSidecar.Blobs, *blob.KZGBlob())
+						blobTxSidecar.Commitments = append(blobTxSidecar.Commitments, commitment)
+						blobTxSidecar.Proofs = append(blobTxSidecar.Proofs, kzg4844.Proof(sidecar.KZGProof))
+						break
+					}
+				}
+			}
+
+			d.logger.Info("Blob matching results", "matched", matchedCount, "expected", len(blobHashes))
+			if matchedCount == 0 {
+				return nil, fmt.Errorf("no matching versionedHash was found")
+			}
+			batch.Sidecar = blobTxSidecar
+		} else {
+			return nil, fmt.Errorf("not matched blob,txHash:%v,blockNumber:%v", txHash, blockNumber)
 		}
 	}
-	batch.Sidecar = bts
+
+	// Get L2 height
 	l2Height, err := d.l2Client.BlockNumber(d.ctx)
 	if err != nil {
 		return nil, fmt.Errorf("query l2 block number error:%v", err)
@@ -329,8 +457,8 @@ func (d *Derivation) fetchRollupDataByTxHash(txHash common.Hash, blockNumber uin
 
 func (d *Derivation) UnPackData(data []byte) (geth.RPCRollupBatch, error) {
 	var batch geth.RPCRollupBatch
-	if bytes.Equal(d.rollupABI.Methods["commitBatch"].ID, data[:4]) {
-		args, err := d.rollupABI.Methods["commitBatch"].Inputs.Unpack(data[4:])
+	if bytes.Equal(d.beforeMoveBlockCtxABI.Methods["commitBatch"].ID, data[:4]) {
+		args, err := d.beforeMoveBlockCtxABI.Methods["commitBatch"].Inputs.Unpack(data[4:])
 		if err != nil {
 			return batch, fmt.Errorf("submitBatches Unpack error:%v", err)
 		}
@@ -365,13 +493,58 @@ func (d *Derivation) UnPackData(data []byte) (geth.RPCRollupBatch, error) {
 			WithdrawalRoot         [32]uint8 "json:\"withdrawalRoot\""
 		})
 		batch = geth.RPCRollupBatch{
-			Version:                uint(rollupBatchData.Version),
-			ParentBatchHeader:      rollupBatchData.ParentBatchHeader,
-			BlockContexts:          rollupBatchData.BlockContexts,
-			SkippedL1MessageBitmap: rollupBatchData.SkippedL1MessageBitmap,
-			PrevStateRoot:          common.BytesToHash(rollupBatchData.PrevStateRoot[:]),
-			PostStateRoot:          common.BytesToHash(rollupBatchData.PostStateRoot[:]),
-			WithdrawRoot:           common.BytesToHash(rollupBatchData.WithdrawalRoot[:]),
+			Version:           uint(rollupBatchData.Version),
+			ParentBatchHeader: rollupBatchData.ParentBatchHeader,
+			BlockContexts:     rollupBatchData.BlockContexts,
+			PrevStateRoot:     common.BytesToHash(rollupBatchData.PrevStateRoot[:]),
+			PostStateRoot:     common.BytesToHash(rollupBatchData.PostStateRoot[:]),
+			WithdrawRoot:      common.BytesToHash(rollupBatchData.WithdrawalRoot[:]),
+		}
+	} else if bytes.Equal(d.rollupABI.Methods["commitBatch"].ID, data[:4]) {
+		args, err := d.rollupABI.Methods["commitBatch"].Inputs.Unpack(data[4:])
+		if err != nil {
+			return batch, fmt.Errorf("submitBatches Unpack error:%v", err)
+		}
+		rollupBatchData := args[0].(struct {
+			Version           uint8     "json:\"version\""
+			ParentBatchHeader []uint8   "json:\"parentBatchHeader\""
+			LastBlockNumber   uint64    "json:\"lastBlockNumber\""
+			NumL1Messages     uint16    "json:\"numL1Messages\""
+			PrevStateRoot     [32]uint8 "json:\"prevStateRoot\""
+			PostStateRoot     [32]uint8 "json:\"postStateRoot\""
+			WithdrawalRoot    [32]uint8 "json:\"withdrawalRoot\""
+		})
+		batch = geth.RPCRollupBatch{
+			Version:           uint(rollupBatchData.Version),
+			ParentBatchHeader: rollupBatchData.ParentBatchHeader,
+			LastBlockNumber:   rollupBatchData.LastBlockNumber,
+			NumL1Messages:     rollupBatchData.NumL1Messages,
+			PrevStateRoot:     common.BytesToHash(rollupBatchData.PrevStateRoot[:]),
+			PostStateRoot:     common.BytesToHash(rollupBatchData.PostStateRoot[:]),
+			WithdrawRoot:      common.BytesToHash(rollupBatchData.WithdrawalRoot[:]),
+		}
+	} else if bytes.Equal(d.rollupABI.Methods["commitBatchWithProof"].ID, data[:4]) {
+		args, err := d.rollupABI.Methods["commitBatchWithProof"].Inputs.Unpack(data[4:])
+		if err != nil {
+			return batch, fmt.Errorf("commitBatchWithProof Unpack error:%v", err)
+		}
+		rollupBatchData := args[0].(struct {
+			Version           uint8     "json:\"version\""
+			ParentBatchHeader []uint8   "json:\"parentBatchHeader\""
+			LastBlockNumber   uint64    "json:\"lastBlockNumber\""
+			NumL1Messages     uint16    "json:\"numL1Messages\""
+			PrevStateRoot     [32]uint8 "json:\"prevStateRoot\""
+			PostStateRoot     [32]uint8 "json:\"postStateRoot\""
+			WithdrawalRoot    [32]uint8 "json:\"withdrawalRoot\""
+		})
+		batch = geth.RPCRollupBatch{
+			Version:           uint(rollupBatchData.Version),
+			ParentBatchHeader: rollupBatchData.ParentBatchHeader,
+			LastBlockNumber:   rollupBatchData.LastBlockNumber,
+			NumL1Messages:     rollupBatchData.NumL1Messages,
+			PrevStateRoot:     common.BytesToHash(rollupBatchData.PrevStateRoot[:]),
+			PostStateRoot:     common.BytesToHash(rollupBatchData.PostStateRoot[:]),
+			WithdrawRoot:      common.BytesToHash(rollupBatchData.WithdrawalRoot[:]),
 		}
 	} else {
 		return batch, types.ErrNotCommitBatchTx
@@ -380,25 +553,20 @@ func (d *Derivation) UnPackData(data []byte) (geth.RPCRollupBatch, error) {
 }
 
 func (d *Derivation) parseBatch(batch geth.RPCRollupBatch, l2Height uint64) (*BatchInfo, error) {
-	parentBatchHeader, err := types.DecodeBatchHeader(batch.ParentBatchHeader)
-	if err != nil {
-		return nil, fmt.Errorf("decode batch header error:%v", err)
-	}
 	batchInfo := new(BatchInfo)
 	if err := batchInfo.ParseBatch(batch); err != nil {
 		return nil, fmt.Errorf("parse batch error:%v", err)
 	}
-	if err := d.handleL1Message(batchInfo, parentBatchHeader.TotalL1MessagePopped, l2Height); err != nil {
+	if err := d.handleL1Message(batchInfo, batchInfo.parentTotalL1MessagePopped, l2Height); err != nil {
 		return nil, fmt.Errorf("handle l1 message error:%v", err)
 	}
-	batchInfo.batchIndex = parentBatchHeader.BatchIndex + 1
 	return batchInfo, nil
 }
 
 func (d *Derivation) handleL1Message(rollupData *BatchInfo, parentTotalL1MessagePopped, l2Height uint64) error {
 	totalL1MessagePopped := parentTotalL1MessagePopped
 	for bIndex, block := range rollupData.blockContexts {
-		// This may happen to nodes started from sanpshot, in which case we will no longer handle L1Msg
+		// This may happen to nodes started from snapshot, in which case we will no longer handle L1Msg
 		if block.Number <= l2Height {
 			continue
 		}
@@ -413,9 +581,6 @@ func (d *Derivation) handleL1Message(rollupData *BatchInfo, parentTotalL1Message
 		totalL1MessagePopped += uint64(block.l1MsgNum)
 		if len(l1Messages) > 0 {
 			for _, l1Message := range l1Messages {
-				if rollupData.skippedL1MessageBitmap != nil && rollupData.skippedL1MessageBitmap.Bit(int(l1Message.QueueIndex)-int(parentTotalL1MessagePopped)) == 1 {
-					continue
-				}
 				transaction := eth.NewTx(&l1Message.L1MessageTx)
 				l1Transactions = append(l1Transactions, transaction)
 			}

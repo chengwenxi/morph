@@ -1,8 +1,8 @@
 //! Stateless Block Verifier primitives library.
 
-use crate::types::{TxL1Msg, TypedTransaction};
+use crate::types::{tx_alt_fee::TxAltFee, TxL1Msg, TypedTransaction};
 use alloy::{
-    consensus::{SignableTransaction, TxEip1559, TxEip2930, TxEnvelope, TxLegacy},
+    consensus::{SignableTransaction, TxEip1559, TxEip2930, TxEip7702, TxEnvelope, TxLegacy},
     eips::eip2930::AccessList,
     primitives::{Bytes, ChainId, Signature, SignatureError, TxKind},
 };
@@ -17,6 +17,7 @@ pub mod types;
 pub use alloy::{
     consensus as alloy_consensus,
     consensus::Transaction,
+    eips::eip7702::SignedAuthorization,
     primitives as alloy_primitives,
     primitives::{Address, B256, U256},
 };
@@ -182,6 +183,9 @@ pub trait TxTrace {
     /// Get `access_list`.
     fn access_list(&self) -> AccessList;
 
+    /// Get `authorization_list`.
+    fn authorization_list(&self) -> Vec<SignedAuthorization>;
+
     /// Get `signature`.
     fn signature(&self) -> Result<Signature, SignatureError>;
 
@@ -189,6 +193,12 @@ pub trait TxTrace {
     fn is_l1_tx(&self) -> bool {
         self.ty() == 0x7e
     }
+
+    /// Get `fee_token_id`.
+    fn fee_token_id(&self) -> u16;
+
+    /// Get `fee_limit`.
+    fn fee_limit(&self) -> U256;
 
     /// Try to build a typed transaction
     fn try_build_typed_tx(&self) -> Result<TypedTransaction, SignatureError> {
@@ -237,6 +247,22 @@ pub trait TxTrace {
 
                 TypedTransaction::Enveloped(TxEnvelope::from(tx.into_signed(self.signature()?)))
             }
+            0x04 => {
+                let tx = TxEip7702 {
+                    chain_id,
+                    nonce: self.nonce(),
+                    gas_limit: self.gas_limit(),
+                    max_fee_per_gas: self.max_fee_per_gas(),
+                    max_priority_fee_per_gas: self.max_priority_fee_per_gas(),
+                    to: self.to(),
+                    value: self.value(),
+                    access_list: self.access_list(),
+                    authorization_list: self.authorization_list(),
+                    input: self.data(),
+                };
+
+                TypedTransaction::Enveloped(TxEnvelope::from(tx.into_signed(self.signature()?)))
+            }
             0x7e => {
                 let tx = TxL1Msg {
                     tx_hash: self.tx_hash(),
@@ -250,9 +276,25 @@ pub trait TxTrace {
 
                 TypedTransaction::L1Msg(tx)
             }
+            0x7f => {
+                let tx = TxAltFee {
+                    chain_id,
+                    nonce: self.nonce(),
+                    gas_limit: self.gas_limit(),
+                    max_fee_per_gas: self.max_fee_per_gas(),
+                    max_priority_fee_per_gas: self.max_priority_fee_per_gas(),
+                    to: self.to(),
+                    value: self.value(),
+                    access_list: self.access_list(),
+                    input: self.data(),
+                    fee_token_id: self.fee_token_id(),
+                    fee_limit: self.fee_limit(),
+                };
+                println!("tx.self.fee_token_id: {:?}", self.fee_token_id());
+                TypedTransaction::AltFee(tx.into_signed(self.signature()?))
+            }
             _ => unimplemented!("unsupported tx type: {}", self.ty()),
         };
-
         Ok(tx)
     }
 }
@@ -374,7 +416,19 @@ impl<T: TxTrace> TxTrace for &T {
         (*self).access_list()
     }
 
+    fn authorization_list(&self) -> Vec<SignedAuthorization> {
+        (*self).authorization_list()
+    }
+
     fn signature(&self) -> Result<Signature, SignatureError> {
         (*self).signature()
+    }
+
+    fn fee_token_id(&self) -> u16 {
+        (*self).fee_token_id()
+    }
+
+    fn fee_limit(&self) -> U256 {
+        (*self).fee_limit()
     }
 }

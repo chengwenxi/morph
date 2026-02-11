@@ -52,17 +52,13 @@ func RetrieveBlobBytes(blob *kzg4844.Blob) ([]byte, error) {
 	return data, nil
 }
 
-func makeBCP(bz []byte) (b kzg4844.Blob, c kzg4844.Commitment, p kzg4844.Proof, err error) {
+func makeBlobCommitment(bz []byte) (b kzg4844.Blob, c kzg4844.Commitment, err error) {
 	blob, err := MakeBlobCanonical(bz)
 	if err != nil {
 		return
 	}
 	b = *blob
 	c, err = kzg4844.BlobToCommitment(&b)
-	if err != nil {
-		return
-	}
-	p, err = kzg4844.ComputeBlobProof(&b, c)
 	if err != nil {
 		return
 	}
@@ -85,20 +81,19 @@ func MakeBlobTxSidecar(blobBytes []byte) (*eth.BlobTxSidecar, error) {
 		err         error
 		blobs       = make([]kzg4844.Blob, blobCount)
 		commitments = make([]kzg4844.Commitment, blobCount)
-		proofs      = make([]kzg4844.Proof, blobCount)
 	)
 	switch blobCount {
 	case 1:
-		blobs[0], commitments[0], proofs[0], err = makeBCP(blobBytes)
+		blobs[0], commitments[0], err = makeBlobCommitment(blobBytes)
 		if err != nil {
 			return nil, err
 		}
 	case 2:
-		blobs[0], commitments[0], proofs[0], err = makeBCP(blobBytes[:MaxBlobBytesSize])
+		blobs[0], commitments[0], err = makeBlobCommitment(blobBytes[:MaxBlobBytesSize])
 		if err != nil {
 			return nil, err
 		}
-		blobs[1], commitments[1], proofs[1], err = makeBCP(blobBytes[MaxBlobBytesSize:])
+		blobs[1], commitments[1], err = makeBlobCommitment(blobBytes[MaxBlobBytesSize:])
 		if err != nil {
 			return nil, err
 		}
@@ -106,79 +101,22 @@ func MakeBlobTxSidecar(blobBytes []byte) (*eth.BlobTxSidecar, error) {
 	return &eth.BlobTxSidecar{
 		Blobs:       blobs,
 		Commitments: commitments,
-		Proofs:      proofs,
 	}, nil
 }
 
-func EncodeTxsPayloadToBlob(batchBytes []byte) (*eth.BlobTxSidecar, error) {
+func CompressBatchBytes(batchBytes []byte) ([]byte, error) {
 	if len(batchBytes) == 0 {
-		return MakeBlobTxSidecar(batchBytes)
+		return nil, nil
 	}
 	compressedBatchBytes, err := zstd.CompressBatchBytes(batchBytes)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to compress batch bytes, err: %w", err)
 	}
-	return MakeBlobTxSidecar(compressedBatchBytes)
+	return compressedBatchBytes, nil
 }
 
-// Deprecated: DecodeTxsFromBlob is recommended
-func DecodeLegacyTxsFromBlob(b *kzg4844.Blob) (eth.Transactions, error) {
-	data, err := RetrieveBlobBytes(b)
-	if err != nil {
-		return nil, err
-	}
-
-	// metadata || tx_payload
-	// metadata consists of num_chunks (2 bytes) and chunki_size (4 bytes per chunk)
-	dataReader := bytes.NewReader(data[2:])
-	var txPayloadSize uint32
-	for i := 0; i < 15; i++ {
-		var size uint32
-		if err := binary.Read(dataReader, binary.BigEndian, size); err != nil {
-			return nil, err
-		}
-		txPayloadSize += size
-	}
-	txPayload := data[62 : 62+txPayloadSize]
-
-	var byteOccupied int
-	var sizeBytes []byte
-	b3 := byte(txPayloadSize >> 16)
-	b2 := byte(txPayloadSize >> 8)
-	b1 := byte(txPayloadSize)
-	if b3 > 0 {
-		byteOccupied = 3
-		sizeBytes = []byte{b3, b2, b1}
-	} else if b2 > 0 {
-		byteOccupied = 2
-		sizeBytes = []byte{b2, b1}
-	} else {
-		byteOccupied = 1
-		sizeBytes = []byte{b1}
-	}
-
-	fistByte := byte(247 + byteOccupied)
-	simulatedRLP := append(append([]byte{fistByte}, sizeBytes...), txPayload...)
-	decoded := make([]*eth.Transaction, 0)
-	if err := rlp.DecodeBytes(simulatedRLP, &decoded); err != nil {
-		return nil, err
-	}
-	return decoded, nil
-}
-
-func DecodeTxsFromBlob(blob *kzg4844.Blob) (eth.Transactions, error) {
-	if isEmptyBlob(blob) {
-		return eth.Transactions{}, nil
-	}
-	data, err := RetrieveBlobBytes(blob)
-	if err != nil {
-		return nil, err
-	}
-	batchBytes, err := zstd.DecompressBatchBytes(data)
-	if err != nil {
-		return nil, err
-	}
-	reader := bytes.NewReader(batchBytes)
+func DecodeTxsFromBytes(txsBytes []byte) (eth.Transactions, error) {
+	reader := bytes.NewReader(txsBytes)
 	txs := make(eth.Transactions, 0)
 	for {
 		var (
@@ -210,6 +148,16 @@ func DecodeTxsFromBlob(blob *kzg4844.Blob) (eth.Transactions, error) {
 				return nil, err
 			}
 			innerTx = new(eth.DynamicFeeTx)
+		case eth.SetCodeTxType:
+			if err := binary.Read(reader, binary.BigEndian, &firstByte); err != nil {
+				return nil, err
+			}
+			innerTx = new(eth.SetCodeTx)
+		case eth.AltFeeTxType:
+			if err := binary.Read(reader, binary.BigEndian, &firstByte); err != nil {
+				return nil, err
+			}
+			innerTx = new(eth.AltFeeTx)
 		default:
 			if firstByte <= 0xf7 { // legacy tx first byte must be greater than 0xf7(247)
 				return nil, fmt.Errorf("not supported tx type: %d", firstByte)
@@ -236,15 +184,6 @@ func DecodeTxsFromBlob(blob *kzg4844.Blob) (eth.Transactions, error) {
 		txs = append(txs, eth.NewTx(innerTx))
 	}
 	return txs, nil
-}
-
-func isEmptyBlob(blob *kzg4844.Blob) bool {
-	for _, b := range blob {
-		if b != 0 {
-			return false
-		}
-	}
-	return true
 }
 
 func extractInnerTxFullBytes(firstByte byte, reader io.Reader) ([]byte, error) {

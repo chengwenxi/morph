@@ -34,7 +34,7 @@ pub fn prove(
 
     // Prepare input.
     // Convert the traces' format to reduce conversion costs in the client.
-    blocks.iter_mut().for_each(|blobk| blobk.flatten());
+    blocks.iter_mut().for_each(|block| block.flatten());
     let client_input =
         ClientInput { l2_traces: blocks.clone(), blob_info: get_blob_info(blocks).unwrap() };
 
@@ -145,7 +145,7 @@ mod tests {
         std::env::set_var("TRUSTED_SETUP_4844", "../../configs/4844_trusted_setup.txt");
         let blob_info: BlobInfo = populate_kzg(&blob).unwrap();
 
-        let (versioned_hash, batch_data) = BlobVerifier::verify(&blob_info).unwrap();
+        let (versioned_hash, batch_data) = BlobVerifier::verify(&blob_info, 1).unwrap();
         println!(
             "versioned_hash: {:?}, batch_data len: {:?}",
             hex::encode(versioned_hash.as_slice()),
